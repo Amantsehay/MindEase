@@ -20,18 +20,68 @@ from app.services.voice_context_service import voice_context_service
 logger = logging.getLogger(__name__)
 
 
+# Max prior in-call turns to replay into each fresh Live session so the model
+# keeps continuity across the native-audio model's per-turn session resets.
+_MAX_REPLAY_TURNS = 6
+
+
 # ---------- helpers ----------
 
-def _build_persona_prompt(persona_name: str, persona_blurb: str, locale: str = "en") -> str:
+# Per-persona behavioural styling. The picker card's short blurb (from i18n)
+# gives the user a flavour preview; this dict gives the model concrete
+# behaviour cues — question style, pacing, tone — so personas actually feel
+# distinct in conversation. Keyed by persona_id; missing key = no extra style.
+_PERSONA_STYLES: dict[str, str] = {
+    "alex": (
+        "Curious and engaged. Ask open questions to draw the user out — "
+        "\"What does that look like for you?\", \"What is behind that?\" "
+        "— and reflect patterns back. Energy is light but never glib; take "
+        "feelings seriously while leaning into possibility."
+    ),
+    "ashenafi": (
+        "Steady and reassuring. Speak with quiet confidence — slow, "
+        "anchored, no hedging. Validate feelings directly, then remind the "
+        "user of strengths and resources they already have. Do not rush to "
+        "fix; sit with hard things and name them honestly."
+    ),
+    "bedru": (
+        "Soft-spoken and unhurried. Move at the user's pace, leave room "
+        "for silence, ask gentle \"what is that like for you?\" questions. "
+        "Never push; honour whatever surfaces — even \"I don't know\" or "
+        "plain exhaustion."
+    ),
+    "sora": (
+        "Thoughtful and introspective. Reflect back what you hear with "
+        "care, asking what is underneath the surface — what need, what "
+        "fear, what hope. Invite slow exploration rather than quick "
+        "answers. Quiet warmth, not bright energy."
+    ),
+    "tigist": (
+        "Warm and encouraging. Notice and celebrate small wins, look for "
+        "what is working, gently reframe setbacks as part of the path. "
+        "Lift energy without minimising — meet the user where they are "
+        "first, then bring hope in."
+    ),
+}
+
+
+def _build_persona_prompt(
+    persona_name: str,
+    persona_blurb: str,
+    locale: str = "en",
+    persona_id: str = "",
+) -> str:
     # locale kept in the signature for callers that still pass it, but it is
     # intentionally NOT injected — Gemini Live auto-detects language from the
     # user's speech, and a hard-coded directive plus the localized persona
     # name plus past Amharic memory chunks were biasing the model.
     _ = locale
+    style_extra = _PERSONA_STYLES.get(persona_id, "")
     return (
         f"You are {persona_name}, a warm and empathetic AI wellness companion. "
         f"Your style: {persona_blurb or 'warm, attentive, easy to talk to.'} "
-        f"Stay in character as {persona_name} throughout — if asked your name, "
+        + (f"{style_extra} " if style_extra else "")
+        + f"Stay in character as {persona_name} throughout — if asked your name, "
         f"you are {persona_name}, never another assistant. "
         "You help people explore feelings, offer emotional support, and use "
         "CBT/mindfulness-style guidance. Keep responses conversational, under "
@@ -89,16 +139,52 @@ class VoiceService:
         self._user_buf: list[str] = []
         self._ai_buf: list[str] = []
 
+        # Rolling in-memory record of completed turns in THIS call. Replayed
+        # into each fresh Live session on reconnect so the model resumes the
+        # dialog instead of greeting again. Independent of long-term RAG.
+        self._history: list[tuple[str, str]] = []
+
+    def _format_history_block(self) -> str:
+        """Render the in-call dialog as text for the system instruction.
+        send_client_content(turn_complete=False) does not influence the
+        native-audio Live model across the per-turn session resets, so we
+        embed the recent exchanges directly into the prompt with an explicit
+        \"do not re-greet, continue from here\" directive."""
+        if not self._history:
+            return ""
+        lines: list[str] = []
+        for u_text, a_text in self._history:
+            if u_text:
+                lines.append(f"User: {u_text}")
+            if a_text:
+                lines.append(f"You: {a_text}")
+        body = "\n".join(lines)
+        return (
+            "## Conversation so far in this call\n"
+            "You have already been talking with this user. Do NOT greet again "
+            "or re-introduce yourself. Continue from where you left off, "
+            "responding to the user's next message naturally based on the "
+            "dialog below.\n\n"
+            f"{body}"
+        )
+
     async def _build_system_instruction(self) -> str:
         async with async_session_maker() as db:
             dossier = await voice_context_service.build(db, self.user_id)
-            seed_query = f"voice conversation with {self.persona_name}: {self.persona_blurb}"
+            # Use the user's most recent utterance as the similarity seed so
+            # retrieval matches what they're talking about right now. Falls
+            # back to a persona-flavoured static string only on the first
+            # session open (empty history) when we have no user signal yet.
+            seed_query = next(
+                (u for u, _ in reversed(self._history) if u),
+                f"voice conversation with {self.persona_name}: {self.persona_blurb}",
+            )
             try:
                 retrieved = await memory_service.retrieve(
                     db,
                     user_id=self.user_id,
                     query_text=seed_query,
-                    k=10,
+                    k=20,
                     kinds=[
                         "message", "mood_note", "assessment_result",
                         "summary", "profile_fact", "voice_transcript",
@@ -109,11 +195,14 @@ class VoiceService:
                 logger.warning("voice retrieve failed: %s", exc)
                 retrieved = []
 
-        blocks: list[str] = [_build_persona_prompt(self.persona_name, self.persona_blurb, self.locale)]
+        blocks: list[str] = [_build_persona_prompt(self.persona_name, self.persona_blurb, self.locale, self.persona_id)]
         if dossier:
             blocks.append(dossier)
         if retrieved:
             blocks.append("## Relevant past moments\n" + _format_chunks(retrieved))
+        in_call = self._format_history_block()
+        if in_call:
+            blocks.append(in_call)
         assembled = "\n\n".join(blocks)
         logger.info(
             "voice system_instruction assembled for user=%s persona=%s len=%d",
@@ -283,6 +372,14 @@ class VoiceService:
                     ai_text = "".join(self._ai_buf).strip()
                     self._user_buf.clear()
                     self._ai_buf.clear()
+                    # Snapshot the turn into in-memory history BEFORE the
+                    # fire-and-forget DB flush. The supervisor may reopen the
+                    # Live session before the DB write commits, and the
+                    # replay path needs the latest turn to be present.
+                    if user_text or ai_text:
+                        self._history.append((user_text, ai_text))
+                        if len(self._history) > _MAX_REPLAY_TURNS:
+                            self._history = self._history[-_MAX_REPLAY_TURNS:]
                     print(
                         f"[voice] turn_complete #{turn_idx} u={len(user_text)} a={len(ai_text)}",
                         flush=True,

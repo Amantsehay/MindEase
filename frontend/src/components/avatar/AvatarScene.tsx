@@ -232,6 +232,11 @@ function AvatarPicker({
         {avatars.map((a) => {
           const available = !!a.url;
           const playing = playingId === a.id;
+          // On hover: prefetch the viewer JS bundle AND the 13 MB GLB model
+          // into the browser cache. The GLB has no quota cost (just bytes),
+          // and downloading it during hover means click → viewer mount is
+          // instant. TTS audio is NOT prefetched here — Gemini TTS has a
+          // 100/day quota that hover-prefetch would quickly exhaust.
           const onIntent = available
             ? () => {
                 prefetchViewer();
